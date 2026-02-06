@@ -1,0 +1,127 @@
+#include <stdio.h>
+#include <string.h>
+
+#define SIZE 50
+
+struct Contact {
+    int id;
+    char name[30];
+    char mobile[15];
+    char email[30];
+};
+
+struct Contact book[SIZE];
+int totalContacts = 0;
+int idCounter = 1;
+
+void addContact() {
+    if (totalContacts >= SIZE) {
+        printf("\nContact list is full!\n");
+        return;
+    }
+
+    book[totalContacts].id = idCounter++;
+
+    printf("\nEnter Name   : ");
+    scanf(" %[^\n]", book[totalContacts].name);
+
+    printf("Enter Mobile : ");
+    scanf(" %[^\n]", book[totalContacts].mobile);
+
+    printf("Enter Email  : ");
+    scanf(" %[^\n]", book[totalContacts].email);
+
+    printf("\nContact added successfully!");
+    printf("\nAssigned Contact ID: %d\n", book[totalContacts].id);
+
+    totalContacts++;
+}
+
+
+void viewContacts() {
+    if (totalContacts == 0) {
+        printf("\nNo contacts available!\n");
+        return;
+    }
+
+    printf("\n======= CONTACT LIST =======\n");
+    for (int i = 0; i < totalContacts; i++) {
+        printf("\nID     : %d", book[i].id);
+        printf("\nName   : %s", book[i].name);
+        printf("\nMobile : %s", book[i].mobile);
+        printf("\nEmail  : %s\n", book[i].email);
+    }
+}
+
+
+void searchContact() {
+    int searchId, found = 0;
+
+    printf("\nEnter Contact ID to search: ");
+    scanf("%d", &searchId);
+
+    for (int i = 0; i < totalContacts; i++) {
+        if (book[i].id == searchId) {
+            printf("\nContact Found!");
+            printf("\nName   : %s", book[i].name);
+            printf("\nMobile : %s", book[i].mobile);
+            printf("\nEmail  : %s\n", book[i].email);
+            found = 1;
+            break;
+        }
+    }
+
+    if (!found)
+        printf("\nContact not found!\n");
+}
+
+
+void deleteContact() {
+    int deleteId, found = 0;
+
+    printf("\nEnter Contact ID to delete: ");
+    scanf("%d", &deleteId);
+
+    for (int i = 0; i < totalContacts; i++) {
+        if (book[i].id == deleteId) {
+            for (int j = i; j < totalContacts - 1; j++) {
+                book[j] = book[j + 1];
+            }
+            totalContacts--;
+            found = 1;
+            printf("\nContact deleted successfully!\n");
+            break;
+        }
+    }
+
+    if (!found)
+        printf("\nContact ID not found!\n");
+}
+
+
+int main() {
+    int choice;
+
+    do {
+        printf("\n====== CONTACT MANAGEMENT SYSTEM ======\n");
+        printf("1. Add Contact\n");
+        printf("2. View Contacts\n");
+        printf("3. Search Contact (by ID)\n");
+        printf("4. Delete Contact\n");
+        printf("5. Exit\n");
+        printf("Enter your choice: ");
+        scanf("%d", &choice);
+
+        switch (choice) {
+            case 1: addContact(); break;
+            case 2: viewContacts(); break;
+            case 3: searchContact(); break;
+            case 4: deleteContact(); break;
+            case 5: printf("\nExiting program...\n"); break;
+            default: printf("\nInvalid choice!\n");
+        }
+
+    } while (choice != 5);
+
+    return 0;
+}
