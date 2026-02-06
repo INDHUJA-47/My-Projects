@@ -12,7 +12,19 @@ struct Contact {
 
 struct Contact book[SIZE];
 int totalContacts = 0;
-int idCounter = 1;
+int idCounter = 101;
+
+int isValidGmail(char email[]) {
+    int len = strlen(email);
+
+    if (len < 10)
+        return 0;
+
+    if (strcmp(email + len - 10, "@gmail.com") == 0)
+        return 1;
+
+    return 0;
+}
 
 void addContact() {
     if (totalContacts >= SIZE) {
@@ -31,12 +43,16 @@ void addContact() {
     printf("Enter Email  : ");
     scanf(" %[^\n]", book[totalContacts].email);
 
+    if (!isValidGmail(book[totalContacts].email)) {
+        printf("\nInvalid email! Only @gmail.com is allowed.\n");
+        return;
+    }
+
     printf("\nContact added successfully!");
     printf("\nAssigned Contact ID: %d\n", book[totalContacts].id);
 
     totalContacts++;
 }
-
 
 void viewContacts() {
     if (totalContacts == 0) {
@@ -52,7 +68,6 @@ void viewContacts() {
         printf("\nEmail  : %s\n", book[i].email);
     }
 }
-
 
 void searchContact() {
     int searchId, found = 0;
@@ -74,7 +89,6 @@ void searchContact() {
     if (!found)
         printf("\nContact not found!\n");
 }
-
 
 void deleteContact() {
     int deleteId, found = 0;
@@ -98,7 +112,6 @@ void deleteContact() {
         printf("\nContact ID not found!\n");
 }
 
-
 int main() {
     int choice;
 
@@ -106,7 +119,7 @@ int main() {
         printf("\n====== CONTACT MANAGEMENT SYSTEM ======\n");
         printf("1. Add Contact\n");
         printf("2. View Contacts\n");
-        printf("3. Search Contact (by ID)\n");
+        printf("3. Search Contact\n");
         printf("4. Delete Contact\n");
         printf("5. Exit\n");
         printf("Enter your choice: ");
