@@ -1,0 +1,117 @@
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+
+void showMenu() {
+    printf("\n===== TYPING TUTOR =====\n");
+    printf("1. Easy\n");
+    printf("2. Medium\n");
+    printf("3. Hard\n");
+    printf("Choose level: ");
+}
+
+char* getText(int level) {
+    if (level == 1)
+        return "C is a powerful programming language.";
+    else if (level == 2)
+        return "C programming helps you understand memory and system level concepts.";
+    else
+        return "Soliton Technologies expects strong problem solving and core C fundamentals.";
+}
+
+int getTimeLimit(int level) {
+    if (level == 1) return 60;
+    else if (level == 2) return 45;
+    else return 30;
+}
+
+double calculateAccuracy(char original[], char typed[],
+                          int *correct, int *wrong, int *missing) {
+
+    int len1 = strlen(original);
+    int len2 = strlen(typed);
+    int min = len1 < len2 ? len1 : len2;
+
+    *correct = *wrong = 0;
+
+    for (int i = 0; i < min; i++) {
+        if (original[i] == typed[i])
+            (*correct)++;
+        else
+            (*wrong)++;
+    }
+
+    if (len1 > len2)
+        *missing = len1 - len2;
+    else
+        *missing = 0;
+
+    return ((double)(*correct) / len1) * 100;
+}
+
+double calculateWPM(int chars, double time_sec) {
+    return ((chars / 5.0) / (time_sec / 60));
+}
+
+void saveResult(double wpm, double accuracy, double time) {
+    FILE *fp = fopen("results.txt", "a");
+    if (fp == NULL)
+        return;
+
+    fprintf(fp, "WPM: %.2f | Accuracy: %.2f%% | Time: %.2f sec\n",
+            wpm, accuracy, time);
+    fclose(fp);
+}
+
+int main() {
+    int choice;
+    char typed[300];
+
+    showMenu();
+    scanf("%d", &choice);
+    getchar();
+
+    char *original = getText(choice);
+    int timeLimit = getTimeLimit(choice);
+
+    printf("\nType the following text:\n\n");
+    printf("%s\n", original);
+    printf("\nTime Limit: %d seconds\n", timeLimit);
+    printf("Press ENTER to start...\n");
+    getchar();
+
+    time_t start = time(NULL);
+    fgets(typed, sizeof(typed), stdin);
+    time_t end = time(NULL);
+
+    typed[strcspn(typed, "\n")] = '\0';
+
+    double time_taken = difftime(end, start);
+    if (time_taken < 1)
+        time_taken = 1;
+
+    int correct, wrong, missing;
+    double accuracy = calculateAccuracy(
+        original, typed,
+        &correct, &wrong, &missing
+    );
+
+    double wpm = calculateWPM(strlen(typed), time_taken);
+
+    printf("\n===== RESULT =====\n");
+    printf("Time Taken : %.2f seconds\n", time_taken);
+    printf("Correct    : %d\n", correct);
+    printf("Wrong      : %d\n", wrong);
+    printf("Missing    : %d\n", missing);
+    printf("Accuracy   : %.2f %%\n", accuracy);
+    printf("Speed      : %.2f WPM\n", wpm);
+
+    if (time_taken > timeLimit)
+        printf("Status     : Time Limit Exceeded\n");
+    else
+        printf("Status     : Completed in Time\n");
+
+    saveResult(wpm, accuracy, time_taken);
+
+    return 0;
+}
