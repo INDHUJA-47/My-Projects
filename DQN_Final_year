@@ -1,0 +1,374 @@
+"""
+IoT Fog Computing Task Scheduling using Deep Q-Network (DQN)
+================================================================
+At each run, the terminal asks for:
+  - number of edge devices (IoT sensor tasks)
+  - number of fog nodes
+
+A DQN agent is trained to schedule each edge-device task onto one of
+the fog nodes so as to minimize a combined latency + energy cost,
+learning to prefer free (less busy) and more capable fog nodes.
+
+The trained policy is then evaluated at workload levels
+[10,20,30,40,50,70,100]% and the results are plotted as
+Energy-vs-Workload and Latency-vs-Workload graphs.
+
+Requirements (already installed): numpy, torch, matplotlib, pandas
+Run:  python iot_fog_dqn.py
+"""
+
+import random
+from collections import deque
+from dataclasses import dataclass
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+# ----------------------------------------------------------------------
+# Reproducibility
+# ----------------------------------------------------------------------
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+RNG = np.random.default_rng(SEED)
+
+# ----------------------------------------------------------------------
+# Fixed cost-model constants
+# ----------------------------------------------------------------------
+TASK_MAX_MI = 500.0          # million instructions of a task at 100% workload
+LOAD_INCREMENT_FACTOR = 0.3  # how much a node's busy level rises per task assigned
+TRANSMISSION_LATENCY = 0.01  # fixed edge -> fog network hop latency (s)
+TRANSMISSION_ENERGY_COEFF = 0.0002  # J per MI transmitted to a fog node
+
+DEFAULT_WORKLOAD_LEVELS = [10, 20, 30, 40, 50, 70, 100]  # % evaluated for the plots
+
+
+# ----------------------------------------------------------------------
+# Terminal input helpers
+# ----------------------------------------------------------------------
+def prompt_int(message: str, default: int, minimum: int = 1) -> int:
+    while True:
+        raw = input(f"{message} [default {default}]: ").strip()
+        if raw == "":
+            return default
+        try:
+            value = int(raw)
+            if value < minimum:
+                print(f"  Please enter a number >= {minimum}.")
+                continue
+            return value
+        except ValueError:
+            print("  Please enter a valid integer.")
+
+
+def prompt_workload_levels() -> list:
+    default_str = ",".join(str(w) for w in DEFAULT_WORKLOAD_LEVELS)
+    raw = input(
+        f"Enter workload levels (%) to test, comma-separated (e.g. {default_str}), "
+        f"or press Enter for the default: "
+    ).strip()
+    if raw == "":
+        return DEFAULT_WORKLOAD_LEVELS
+    try:
+        values = [float(v) for v in raw.split(",")]
+        if any(v <= 0 or v > 100 for v in values):
+            print("  Workload values must be between 1 and 100. Using default instead.")
+            return DEFAULT_WORKLOAD_LEVELS
+        return values
+    except ValueError:
+        print("  Could not parse values. Using default instead.")
+        return DEFAULT_WORKLOAD_LEVELS
+
+
+def prompt_busy_levels(n: int) -> np.ndarray:
+    raw = input(
+        f"Enter busy levels (%) for the {n} fog node(s), comma-separated "
+        f"(e.g. 90,20,10,30,90), or press Enter to randomize: "
+    ).strip()
+    if raw == "":
+        return np.round(RNG.uniform(10, 95, n), 1)
+    try:
+        values = [float(v) for v in raw.split(",")]
+        if len(values) != n:
+            print(f"  Expected {n} values, got {len(values)}. Randomizing instead.")
+            return np.round(RNG.uniform(10, 95, n), 1)
+        return np.array(values, dtype=float)
+    except ValueError:
+        print("  Could not parse values. Randomizing instead.")
+        return np.round(RNG.uniform(10, 95, n), 1)
+
+
+# ----------------------------------------------------------------------
+# Network configuration (edge devices -> fog nodes)
+# ----------------------------------------------------------------------
+@dataclass
+class NetworkConfig:
+    num_tasks: int
+    num_fog: int
+    capacity: np.ndarray        # MIPS, one per fog node
+    energy_coeff: np.ndarray    # J per MI, one per fog node
+    initial_busy: np.ndarray    # %, one per fog node
+
+
+def build_network_config(num_tasks: int, num_fog: int, fog_busy: np.ndarray) -> NetworkConfig:
+    fog_capacity = RNG.uniform(500, 1200, num_fog)
+    fog_energy = RNG.uniform(0.0008, 0.0018, num_fog)
+    return NetworkConfig(num_tasks, num_fog, fog_capacity, fog_energy, fog_busy)
+
+
+def print_network_summary(config: NetworkConfig):
+    labels = [f"Fog-{i+1}" for i in range(config.num_fog)]
+    df = pd.DataFrame({
+        "Fog Node": labels,
+        "Capacity (MIPS)": np.round(config.capacity, 1),
+        "Energy Coeff (J/MI)": config.energy_coeff,
+        "Initial Busy (%)": config.initial_busy,
+    })
+    print("\nNetwork configuration:")
+    print(df.to_string(index=False))
+    print()
+
+
+# ----------------------------------------------------------------------
+# Cost model: latency and energy of running one task on one fog node
+# ----------------------------------------------------------------------
+def compute_latency_energy(node_idx: int, workload_pct: float, busy_levels: np.ndarray, config: NetworkConfig):
+    workload_mi = (workload_pct / 100.0) * TASK_MAX_MI
+    busy = busy_levels[node_idx]
+
+    processing_latency = workload_mi / config.capacity[node_idx]
+    queuing_latency = processing_latency * (busy / 100.0)          # congestion penalty
+    latency = TRANSMISSION_LATENCY + processing_latency + queuing_latency
+
+    processing_energy = workload_mi * config.energy_coeff[node_idx]
+    congestion_energy = processing_energy * (busy / 100.0) * 0.5   # retries/overhead under load
+    tx_energy = workload_mi * TRANSMISSION_ENERGY_COEFF
+    energy = tx_energy + processing_energy + congestion_energy
+
+    return latency, energy
+
+
+# ----------------------------------------------------------------------
+# Environment: one episode = scheduling config.num_tasks edge-device tasks
+# ----------------------------------------------------------------------
+class SchedulingEnv:
+    def __init__(self, config: NetworkConfig, workload_levels: list):
+        self.config = config
+        self.workload_levels = workload_levels
+        self.busy_levels = None
+        self.workload_pct = None
+        self.steps_done = 0
+
+    def reset(self, workload_pct=None, start_busy_levels=None):
+        self.busy_levels = (
+            self.config.initial_busy.copy() if start_busy_levels is None else start_busy_levels.copy()
+        )
+        self.workload_pct = workload_pct if workload_pct is not None else random.choice(self.workload_levels)
+        self.steps_done = 0
+        return self._state()
+
+    def _state(self):
+        return np.concatenate([self.busy_levels / 100.0, [self.workload_pct / 100.0]]).astype(np.float32)
+
+    def step(self, action):
+        latency, energy = compute_latency_energy(action, self.workload_pct, self.busy_levels, self.config)
+
+        overload_penalty = 5.0 if self.busy_levels[action] >= 100 else 0.0
+        reward = -(latency + energy) - overload_penalty
+
+        self.busy_levels[action] = min(100.0, self.busy_levels[action] + self.workload_pct * LOAD_INCREMENT_FACTOR)
+        self.steps_done += 1
+        done = self.steps_done >= self.config.num_tasks
+
+        return self._state(), reward, done, {"latency": latency, "energy": energy, "node": action}
+
+
+# ----------------------------------------------------------------------
+# DQN agent
+# ----------------------------------------------------------------------
+class QNetwork(nn.Module):
+    def __init__(self, state_dim, action_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, 64), nn.ReLU(),
+            nn.Linear(64, 64), nn.ReLU(),
+            nn.Linear(64, action_dim),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class ReplayBuffer:
+    def __init__(self, capacity=15000):
+        self.buffer = deque(maxlen=capacity)
+
+    def push(self, *transition):
+        self.buffer.append(transition)
+
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, batch_size)
+        s, a, r, s2, d = map(np.array, zip(*batch))
+        return s, a, r, s2, d
+
+    def __len__(self):
+        return len(self.buffer)
+
+
+class DQNAgent:
+    def __init__(self, state_dim, action_dim):
+        self.action_dim = action_dim
+        self.policy_net = QNetwork(state_dim, action_dim)
+        self.target_net = QNetwork(state_dim, action_dim)
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=1e-3)
+        self.buffer = ReplayBuffer()
+
+        self.gamma = 0.95
+        self.epsilon = 1.0
+        self.epsilon_min = 0.05
+        self.epsilon_decay = 0.998
+        self.batch_size = 32
+        self.tau = 0.01  # soft target update
+
+    def select_action(self, state, greedy=False):
+        if not greedy and random.random() < self.epsilon:
+            return random.randrange(self.action_dim)
+        with torch.no_grad():
+            q_values = self.policy_net(torch.as_tensor(state, dtype=torch.float32))
+            return int(torch.argmax(q_values).item())
+
+    def train_step(self):
+        if len(self.buffer) < self.batch_size:
+            return
+        s, a, r, s2, d = self.buffer.sample(self.batch_size)
+        s = torch.as_tensor(s, dtype=torch.float32)
+        a = torch.as_tensor(a, dtype=torch.long)
+        r = torch.as_tensor(r, dtype=torch.float32)
+        s2 = torch.as_tensor(s2, dtype=torch.float32)
+        d = torch.as_tensor(d, dtype=torch.float32)
+
+        q_values = self.policy_net(s).gather(1, a.unsqueeze(1)).squeeze(1)
+        with torch.no_grad():
+            next_q = self.target_net(s2).max(1)[0]
+            target = r + self.gamma * next_q * (1 - d)
+
+        loss = nn.functional.mse_loss(q_values, target)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        for tp, pp in zip(self.target_net.parameters(), self.policy_net.parameters()):
+            tp.data.copy_(self.tau * pp.data + (1 - self.tau) * tp.data)
+
+    def decay_epsilon(self):
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+
+
+# ----------------------------------------------------------------------
+# Training
+# ----------------------------------------------------------------------
+def train_agent(config: NetworkConfig, workload_levels: list, num_episodes=1500):
+    env = SchedulingEnv(config, workload_levels)
+    state_dim = config.num_fog + 1
+    agent = DQNAgent(state_dim, config.num_fog)
+
+    for _ in range(num_episodes):
+        state = env.reset()  # random workload each episode -> generalizes across all levels
+        done = False
+        while not done:
+            action = agent.select_action(state)
+            next_state, reward, done, _ = env.step(action)
+            agent.buffer.push(state, action, reward, next_state, float(done))
+            agent.train_step()
+            state = next_state
+        agent.decay_epsilon()
+
+    return agent
+
+
+# ----------------------------------------------------------------------
+# Evaluation across workload levels
+# ----------------------------------------------------------------------
+def evaluate_agent(agent: DQNAgent, config: NetworkConfig, workload_levels: list):
+    env = SchedulingEnv(config, workload_levels)
+    results = []
+    labels = [f"Fog-{i+1}" for i in range(config.num_fog)]
+
+    for workload in workload_levels:
+        state = env.reset(workload_pct=workload, start_busy_levels=config.initial_busy)
+        done = False
+        latencies, energies, chosen_nodes = [], [], []
+
+        while not done:
+            action = agent.select_action(state, greedy=True)
+            state, _, done, info = env.step(action)
+            latencies.append(info["latency"])
+            energies.append(info["energy"])
+            chosen_nodes.append(action)
+
+        most_used = int(np.bincount(chosen_nodes, minlength=config.num_fog).argmax())
+        results.append({
+            "Workload (%)": workload,
+            "Avg Latency (s)": np.mean(latencies),
+            "Avg Energy (J)": np.mean(energies),
+            "Most Used Fog Node": labels[most_used],
+        })
+
+    return pd.DataFrame(results)
+
+
+# ----------------------------------------------------------------------
+# Plotting
+# ----------------------------------------------------------------------
+def plot_results(df: pd.DataFrame):
+    fig1, ax1 = plt.subplots(figsize=(7, 5))
+    ax1.plot(df["Workload (%)"], df["Avg Energy (J)"], marker="o", color="tab:orange", linewidth=2)
+    ax1.set_xlabel("Workload Allocation (%)")
+    ax1.set_ylabel("Average Energy Consumption (J)")
+    ax1.set_title("Energy Consumption vs Workload (DQN Scheduling)")
+    ax1.grid(True, alpha=0.3)
+    fig1.tight_layout()
+    fig1.savefig("energy_vs_workload.png", dpi=150)
+
+    fig2, ax2 = plt.subplots(figsize=(7, 5))
+    ax2.plot(df["Workload (%)"], df["Avg Latency (s)"], marker="s", color="tab:blue", linewidth=2)
+    ax2.set_xlabel("Workload Allocation (%)")
+    ax2.set_ylabel("Average Latency (s)")
+    ax2.set_title("Latency vs Workload (DQN Scheduling)")
+    ax2.grid(True, alpha=0.3)
+    fig2.tight_layout()
+    fig2.savefig("latency_vs_workload.png", dpi=150)
+
+    plt.show()
+
+
+# ----------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------
+if __name__ == "__main__":
+    print("=== IoT Fog Scheduling DQN Setup ===")
+    num_tasks = prompt_int("Number of edge devices (tasks)", default=10, minimum=1)
+    num_fog = prompt_int("Number of fog nodes", default=5, minimum=1)
+    fog_busy = prompt_busy_levels(num_fog)
+    workload_levels = prompt_workload_levels()
+
+    network_config = build_network_config(num_tasks, num_fog, fog_busy)
+    print_network_summary(network_config)
+
+    print("Training DQN scheduler...")
+    trained_agent = train_agent(network_config, workload_levels, num_episodes=1500)
+
+    print("Evaluating across workload levels:", workload_levels)
+    results_df = evaluate_agent(trained_agent, network_config, workload_levels)
+    print("\nResults:\n", results_df.to_string(index=False))
+
+    results_df.to_csv("dqn_scheduling_results.csv", index=False)
+    plot_results(results_df)
+
+    print("\nSaved: energy_vs_workload.png, latency_vs_workload.png, dqn_scheduling_results.csv")
